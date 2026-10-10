@@ -1,4 +1,4 @@
-﻿import fs from 'fs'
+import fs from 'fs'
 import path from 'path'
 import {} from '@shangxueink/koishi-plugin-puppeteer-without-canvas'
 import { Context, Schema, h } from 'koishi'
@@ -10,6 +10,16 @@ const LOGO_DATA_URI = (() => {
     return `data:image/png;base64,${buf.toString('base64')}`
   } catch {
     return ''
+  }
+})()
+
+// 标题“XFLYSIM”左侧的标识：优先使用插件自带 image/XFLYSIM.png，缺失时回退旧 Logo
+const HEADER_LOGO_DATA_URI = (() => {
+  try {
+    const buf = fs.readFileSync(path.resolve(__dirname, '../image/XFLYSIM.png'))
+    return `data:image/png;base64,${buf.toString('base64')}`
+  } catch {
+    return LOGO_DATA_URI
   }
 })()
 
@@ -44,6 +54,139 @@ function loadRankIcon(folder: string, rank: unknown) {
   } catch { return '' }
 }
 
+// 机型轮廓 SVG（static/aircraft/<机型小写>.svg），按 API 返回的机型匹配并缓存
+const aircraftSvgCache = new Map<string, string>()
+function loadAircraftSvg(equipment: unknown): string {
+  const raw = String(equipment ?? '').trim().toLowerCase()
+  if (!raw) return ''
+  // 兼容 "B737-800" 这类带连字符/空格的写法：优先原名，其次仅保留字母数字
+  const candidates = [...new Set([raw, raw.replace(/[^a-z0-9]/g, '')])].filter(Boolean)
+  for (const name of candidates) {
+    if (aircraftSvgCache.has(name)) return aircraftSvgCache.get(name)!
+    try {
+      const file = path.resolve(__dirname, '../static/aircraft/' + name + '.svg')
+      if (fs.existsSync(file)) {
+        const uri = `data:image/svg+xml;base64,${fs.readFileSync(file).toString('base64')}`
+        aircraftSvgCache.set(name, uri)
+        return uri
+      }
+    } catch { }
+  }
+  return ''
+}
+
+// 航司图标来源：
+// - FlightAware：https://www.flightaware.com/images/airline_logos/90p/{ICAO}.png
+// - FlightRadar24：https://www.flightradar24.com/static/images/data/operators/{ICAO}_logo0.png
+// ICAO 必须是三位大写字符，否则接口返回 404 的 "Page Not Found" 网页而非图片。
+// 下载成功后落盘到来源对应目录并长期缓存；后续固定使用本地文件，不再重复请求。
+// 失败仅短期缓存（5 分钟），便于网络恢复后自动重试。
+interface AirlineLogoSource {
+  dir: string
+  url: (code: string) => string
+  referer?: string
+  cache: Map<string, { value: string, expires: number }>
+}
+
+const FLIGHTAWARE_LOGO_SOURCE: AirlineLogoSource = {
+  dir: path.resolve(__dirname, '../static/airline'),
+  url: code => `https://www.flightaware.com/images/airline_logos/90p/${code}.png`,
+  cache: new Map(),
+}
+
+const FR24_LOGO_SOURCE: AirlineLogoSource = {
+  dir: path.resolve(__dirname, '../static/airline/fr24'),
+  url: code => `https://www.flightradar24.com/static/images/data/operators/${code}_logo0.png`,
+  // FR24 静态资源带防盗链，缺少 Referer 会返回 403
+  referer: 'https://www.flightradar24.com/',
+  cache: new Map(),
+}
+
+function getAirlineLogoFromCache(source: AirlineLogoSource, code: string): string | undefined {
+  const entry = source.cache.get(code)
+  if (!entry) return undefined
+  if (Date.now() > entry.expires) {
+    source.cache.delete(code)
+    return undefined
+  }
+  return entry.value
+}
+function setAirlineLogoCache(source: AirlineLogoSource, code: string, value: string, ttlMinutes: number) {
+  source.cache.set(code, { value, expires: Date.now() + ttlMinutes * 60 * 1000 })
+}
+function getAirlineLogoFilePath(source: AirlineLogoSource, code: string) {
+  return path.resolve(source.dir, `${code}.png`)
+}
+function readAirlineLogoFile(source: AirlineLogoSource, code: string): string {
+  try {
+    const file = getAirlineLogoFilePath(source, code)
+    if (!fs.existsSync(file)) return ''
+    const buffer = fs.readFileSync(file)
+    if (!buffer.length) return ''
+    return `data:image/png;base64,${buffer.toString('base64')}`
+  } catch {
+    return ''
+  }
+}
+async function saveAirlineLogoFile(source: AirlineLogoSource, code: string, buffer: Buffer) {
+  try {
+    await fs.promises.mkdir(source.dir, { recursive: true })
+    await fs.promises.writeFile(getAirlineLogoFilePath(source, code), buffer)
+  } catch { }
+}
+// 只接受真正的 PNG，避免把错误页/占位文本写入本地图标目录
+function isPngBuffer(buffer: Buffer) {
+  return buffer.length > 8
+    && buffer[0] === 0x89
+    && buffer.toString('latin1', 1, 4) === 'PNG'
+}
+async function loadAirlineLogoFromSource(source: AirlineLogoSource, airlineIcao: unknown, timeout = 10000): Promise<string> {
+  const code = String(airlineIcao ?? '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+  // 非三位 ICAO 一律跳过：接口会返回 404 网页，请求毫无意义
+  if (!/^[A-Z0-9]{3}$/.test(code)) return ''
+  const cached = getAirlineLogoFromCache(source, code)
+  if (cached !== undefined) return cached
+  const local = readAirlineLogoFile(source, code)
+  if (local) {
+    setAirlineLogoCache(source, code, local, 30 * 24 * 60)
+    return local
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeout)
+  try {
+    const response = await fetch(source.url(code), {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        ...(source.referer ? { 'Referer': source.referer } : {}),
+      },
+    })
+    if (response.ok) {
+      const buffer = Buffer.from(await response.arrayBuffer())
+      if (isPngBuffer(buffer)) {
+        const uri = `data:image/png;base64,${buffer.toString('base64')}`
+        await saveAirlineLogoFile(source, code, buffer)
+        setAirlineLogoCache(source, code, uri, 30 * 24 * 60) // 30 天
+        return uri
+      }
+    }
+    setAirlineLogoCache(source, code, '', 5) // 失败 5 分钟后重试
+  } catch {
+    setAirlineLogoCache(source, code, '', 5)
+  } finally {
+    clearTimeout(timer)
+  }
+  return ''
+}
+async function loadAirlineLogo(airlineIcao: unknown, timeout = 10000): Promise<string> {
+  return loadAirlineLogoFromSource(FLIGHTAWARE_LOGO_SOURCE, airlineIcao, timeout)
+}
+// FlightRadar24 航司图标：与 FlightAware 图标并列展示在飞行员列表的航司列
+async function loadAirlineLogoFr24(airlineIcao: unknown, timeout = 10000): Promise<string> {
+  return loadAirlineLogoFromSource(FR24_LOGO_SOURCE, airlineIcao, timeout)
+}
+
 interface FlightPlan {
   aircraft?: string
   tascruise?: number
@@ -55,7 +198,15 @@ interface FlightPlan {
 }
 
 function renderHeaderLogo() {
-  return `<img class="logo" src="${LOGO_DATA_URI}" alt="XFLYSIM" />`
+  if (!HEADER_LOGO_DATA_URI) return ''
+  return `<img class="logo" src="${HEADER_LOGO_DATA_URI}" alt="XFLYSIM" />`
+}
+
+// 右上角折页时钟：无秒级刷新需求，渲染时取当前时间即可
+function renderFlipClock() {
+  return `<div class="clock">${getClockParts()
+    .map(char => (char === ':' ? '<span class="clock-sep">:</span>' : `<span class="clock-digit">${char}</span>`))
+    .join('')}</div>`
 }
 
 interface Pilot {
@@ -68,6 +219,9 @@ interface Pilot {
   altitude?: number
   groundSpeed?: number
   transponder?: string | number
+  verticalSpeed?: number | null
+  airlineLogoUri?: string
+  airlineLogoFr24Uri?: string
   flightPlan?: FlightPlan
   aircraft?: {
     airline?: string
@@ -152,6 +306,8 @@ export interface Config {
   timeout: number
   viewportWidth: number
   viewportHeight: number
+  deviceScaleFactor: number
+  imageQuality: number
   enableResume: boolean
   satoken: string
   mapboxAccessToken: string
@@ -170,6 +326,8 @@ export const Config: Schema<Config> = Schema.object({
   timeout: Schema.number().default(30000).min(5000).description('请求超时（毫秒）'),
   viewportWidth: Schema.number().default(1680).description('截图宽度'),
   viewportHeight: Schema.number().default(1200).description('截图高度'),
+  deviceScaleFactor: Schema.number().default(2).min(1).max(3).description('截图缩放倍率（2 = 2 倍清晰度，手机查看更锐利）'),
+  imageQuality: Schema.number().default(95).min(50).max(100).description('JPEG 输出质量（越高越清晰，体积越大）'),
   enableResume: Schema.boolean().default(false).description('启用”简历 CID”命令'),
   satoken: Schema.string().role('secret').default('').description('用户信息接口 satoken'),
   mapboxAccessToken: Schema.string().role('secret').default('').description('Mapbox access token（用于执飞航图）'),
@@ -430,6 +588,37 @@ function formatServiceDuration(logonTime?: string) {
   return `${hours}h ${minutes}m`
 }
 
+// 昵称/机长等 name 字段统一只显示前 15 个字符，超出部分以 … 结尾。
+// 机场名（起降机场全称等）不属于 name 字段，不受此限制。
+const NAME_MAX_LENGTH = 25
+function formatName(value: unknown) {
+  const text = toText(value).trim()
+  if (!text) return '--'
+  // 用 Array.from 按码点切分，避免截断 emoji 等代理对字符
+  const chars = Array.from(text)
+  return chars.length <= NAME_MAX_LENGTH ? text : `${chars.slice(0, NAME_MAX_LENGTH).join('')}…`
+}
+
+// 上线时间（北京时间）：上行日期、下行时间，时间精确到秒
+function formatLogonTime(logonTime?: string) {
+  const startedAt = parseXfsBeijingTimestamp(logonTime)
+  if (startedAt == null) return '--'
+  const date = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(startedAt)
+  const time = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Shanghai',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(startedAt)
+  return `<span class="logon-time">${escapeHtml(date)}<br />${escapeHtml(time)}</span>`
+}
+
 function formatControllerFrequency(value?: string | number) {
   const text = toText(value).trim()
   if (!text) return '--'
@@ -622,20 +811,24 @@ function extractImageUrl(value: unknown) {
   return markdown?.[1] || (text.startsWith('http://') || text.startsWith('https://') ? text : '')
 }
 
-function renderSection(title: string, headers: string[], rows: string[], emptyText: string) {
+function renderSection(title: string, headers: string[], rows: string[], emptyText: string, tableClass?: string) {
   const body = rows.length
     ? rows.join('')
     : `<tr class="empty-row"><td colspan="${headers.length}">${escapeHtml(emptyText)}</td></tr>`
 
   return `
     <section class="section">
-      <div class="section-title">${escapeHtml(title)}</div>
-      <table>
-        <thead>
-          <tr>${headers.map(item => `<th>${escapeHtml(item)}</th>`).join('')}</tr>
-        </thead>
-        <tbody>${body}</tbody>
-      </table>
+      <div class="section-header">
+        <div class="section-title">${escapeHtml(title)}</div>
+      </div>
+      <div class="section-body">
+        <table${tableClass ? ` class="${escapeHtml(tableClass)}"` : ''}>
+          <thead>
+            <tr>${headers.map(item => `<th>${escapeHtml(item)}</th>`).join('')}</tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
     </section>
   `
 }
@@ -648,6 +841,19 @@ function renderProgress(percent: number | null | undefined) {
       <div class="progress-text">${percent}%</div>
     </div>
   `
+}
+
+// 航司列：FlightAware 图标在左，右侧追加 FlightRadar24 图标；任一缺失则只显示已有的
+function renderPilotAirlineLogos(pilot: Pilot) {
+  const logos: string[] = []
+  if (pilot.airlineLogoUri) {
+    logos.push(`<img class="row-airline-logo" src="${pilot.airlineLogoUri}" alt="${escapeHtml(pilot.callsign || '')}">`)
+  }
+  if (pilot.airlineLogoFr24Uri) {
+    logos.push(`<img class="row-airline-logo row-airline-logo-fr24" src="${pilot.airlineLogoFr24Uri}" alt="${escapeHtml(pilot.callsign || '')}">`)
+  }
+  if (!logos.length) return '--'
+  return `<div class="airline-logo-group">${logos.join('')}</div>`
 }
 
 function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Config) {
@@ -663,11 +869,13 @@ function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Confi
   const controllers = allControllers.filter(c => !isAtis(c) && !isObserver(c))
 
   const onlineCounts = {
+    total: pilots.length + controllers.length + atisControllers.length + observerControllers.length,
     pilots: pilots.length,
     controllers: controllers.length,
-    atis: atisControllers.length,
     observers: observerControllers.length,
   }
+
+  const updateTime = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
 
   const pilotRows = pilots.map((pilot) => {
     const type = pilot.aircraft?.equipment || pilot.flightPlan?.aircraft || '--'
@@ -677,12 +885,13 @@ function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Confi
     return `
       <tr>
         <td>${escapeHtml(pilot.cid || '--')}</td>
-        <td>${escapeHtml(pilot.name || '--')}</td>
+        <td class="cell-airline">${renderPilotAirlineLogos(pilot)}</td>
         <td>${escapeHtml(pilot.callsign || '--')}</td>
+        <td>${escapeHtml(formatName(pilot.name))}</td>
         <td>${escapeHtml(pilot.transponder == null || String(pilot.transponder).trim() === '' ? '--' : String(pilot.transponder))}</td>
         <td>${escapeHtml(type)}</td>
-        <td>${escapeHtml(departure)}</td>
-        <td>${escapeHtml(arrival)}</td>
+        <td class="airport">${escapeHtml(departure)}</td>
+        <td class="airport">${escapeHtml(arrival)}</td>
         <td>${escapeHtml(formatSpeed(pilot.groundSpeed))}</td>
         <td>${escapeHtml(formatAltitude(pilot.altitude))}</td>
         <td>${escapeHtml(formatServiceDuration(pilot.logonTime))}</td>
@@ -694,11 +903,12 @@ function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Confi
   const controllerRows = controllers.map((controller) => `
     <tr>
       <td>${escapeHtml(controller.cid || '--')}</td>
-      <td>${escapeHtml(controller.name || '--')}</td>
       <td>${escapeHtml(controller.callsign || '--')}</td>
+      <td>${escapeHtml(formatName(controller.name))}</td>
       <td>${escapeHtml(formatRating(controller.rating))}</td>
       <td>${escapeHtml(formatControllerFrequency(controller.frequency))}</td>
       <td>${formatControllerAtis(controller.atis ?? controller.text_atis)}</td>
+      <td>${formatLogonTime(controller.logonTime)}</td>
       <td>${escapeHtml(formatServiceDuration(controller.logonTime))}</td>
     </tr>
   `)
@@ -717,144 +927,276 @@ function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Confi
     <tr>
       <td>${escapeHtml(controller.cid || '--')}</td>
       <td>${escapeHtml(controller.callsign || '--')}</td>
+      <td>${escapeHtml(formatName(controller.name))}</td>
       <td>${escapeHtml(formatControllerFrequency(controller.frequency))}</td>
       <td>${formatControllerAtis(controller.atis ?? controller.text_atis)}</td>
       <td>${escapeHtml(formatServiceDuration(controller.logonTime))}</td>
     </tr>
   `)
 
-  const clock = getClockParts()
-    .map(char => (char === ':' ? '<span class="clock-sep">:</span>' : `<span class="clock-digit">${char}</span>`))
-    .join('')
-
   return `
   <html>
     <head>
       <meta charset="UTF-8" />
-      <link href="https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.css" rel="stylesheet" />
       <style>
         * { box-sizing: border-box; }
         body {
           margin: 0;
-          background: #121316;
-          color: #d8d8d8;
+          background: #0b0d10;
+          color: #e2e4e8;
           font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          text-rendering: optimizeLegibility;
         }
         .page {
-          width: 100%;
-          min-height: 0;
-          padding: 14px 18px 20px;
-          background: #121316;
+          width: 1440px;
+          margin: 0 auto;
+          padding: 28px 32px 36px;
+          background: #0b0d10;
         }
-        .topbar {
+        .header {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          margin-bottom: 12px;
-          min-height: 68px;
+          gap: 16px;
+          margin-bottom: 24px;
         }
-        .logo { height: 58px; width: auto; object-fit: contain; }
+        .logo {
+          height: 48px;
+          width: auto;
+          object-fit: contain;
+          flex-shrink: 0;
+        }
         .clock {
           display: flex;
-          gap: 4px;
           align-items: center;
-          font-family: "Consolas", monospace;
+          gap: 4px;
+          font-family: Consolas, monospace;
+          flex-shrink: 0;
         }
         .clock-digit, .clock-sep {
-          width: 28px;
-          height: 34px;
+          width: 34px;
+          height: 42px;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          border-radius: 7px;
-          background: #f3f3f3;
-          color: #1b1b1b;
-          font-size: 22px;
+          border-radius: 8px;
+          background: linear-gradient(180deg, #fbfbfb 0%, #ededed 49.5%, #d9d9d9 50.5%, #c4c4c4 100%);
+          color: #1a1a1a;
+          font-size: 24px;
           font-weight: 700;
-          box-shadow: 0 2px 6px rgba(0,0,0,.35);
+          box-shadow: 0 3px 8px rgba(0,0,0,.5);
+          position: relative;
+          overflow: hidden;
+        }
+        .clock-digit::after {
+          content: "";
+          position: absolute;
+          left: 0;
+          right: 0;
+          top: 50%;
+          height: 1px;
+          background: rgba(0,0,0,.28);
+          box-shadow: 0 1px 0 rgba(255,255,255,.5);
         }
         .clock-sep {
-          width: 10px;
+          width: 12px;
           background: transparent;
           color: #f3f3f3;
           box-shadow: none;
         }
-        .panel {
-          background: #191b20;
-          border: 1px solid #23262d;
-          border-radius: 12px;
-          padding: 14px 16px 10px;
-        }
-        .titlebar {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 10px 16px;
-          margin-bottom: 12px;
-        }
-        .brand {
-          font-size: 22px;
+
+        .header h1 {
+          margin: 0 0 6px;
+          font-size: 26px;
           font-weight: 800;
-          color: #f0f0f0;
+          color: #f8fafc;
+          letter-spacing: 0.5px;
         }
-        .brand span {
-          color: #4d87d9;
-          margin-left: 8px;
+        .update-time {
+          font-size: 13px;
+          color: #8b929d;
         }
-        .counts {
-          color: #9ea3ab;
-          font-size: 15px;
-          letter-spacing: 0;
+        .cards {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 16px;
+          margin-bottom: 24px;
+        }
+        .card {
+          background: #16191e;
+          border: 1px solid #20242b;
+          border-radius: 12px;
+          padding: 18px 20px;
+        }
+        .card-label {
+          font-size: 14px;
+          color: #9ca3af;
+          margin-bottom: 6px;
+        }
+        .card-value {
+          font-size: 32px;
+          font-weight: 700;
+          color: #4ade80;
+          line-height: 1;
         }
         .section {
-          padding: 14px 14px 18px;
-          border-top: 1px solid #2a2d35;
+          background: #16191e;
+          border: 1px solid #20242b;
+          border-radius: 12px;
+          margin-bottom: 16px;
+          overflow: hidden;
         }
-        .section:first-of-type {
-          border-top: none;
-          padding-top: 0;
+        .section-header {
+          display: flex;
+          align-items: center;
+          padding: 16px 20px;
+          border-bottom: 1px solid #20242b;
         }
         .section-title {
-          font-size: 18px;
-          font-weight: 800;
-          color: #f1f1f1;
-          margin: 2px 0 12px;
+          position: relative;
+          padding-left: 12px;
+          font-size: 16px;
+          font-weight: 700;
+          color: #f1f5f9;
         }
+        .section-title::before {
+          content: '';
+          position: absolute;
+          left: 0;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 4px;
+          height: 16px;
+          background: #f59e0b;
+          border-radius: 2px;
+        }
+        .section-body {
+          padding: 4px 0 0;
+        }
+        /* 左侧：FlightAware 90p 原图，按原比例缩放，不做统一裁框 */
+        .row-airline-logo {
+          height: 20px;
+          width: auto;
+          max-width: 64px;
+          object-fit: contain;
+          background: #ffffff;
+          padding: 1px 2px;
+          box-sizing: content-box;
+          border-radius: 2px;
+          display: block;
+        }
+        /* 右侧：FlightRadar24 图源长宽比差异大（横版带字图偏宽），
+           统一 80×24 固定盒子，按比例缩放居中，避免过宽或过窄 */
+        .row-airline-logo-fr24 {
+          width: 80px;
+          height: 24px;
+          max-width: 80px;
+        }
+        .airline-logo-group {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 4px;
+        }
+        .cell-airline { text-align: center; }
         table {
           width: 100%;
           border-collapse: collapse;
-          table-layout: fixed;
+          table-layout: auto;
         }
         th, td {
           padding: 12px 10px;
-          text-align: center;
-          border-bottom: 1px solid #2a2d35;
+          text-align: left;
+          border-bottom: 1px solid #20242b;
           word-break: break-word;
+          vertical-align: middle;
         }
+        /* 在线飞行员表：12 列全部固定像素宽度（合计 1376px，等于 .page 内容宽度），
+           行宽不再随列内容/容器浮动；表头与单元格内容统一居中。 */
+        .pilot-table {
+          table-layout: fixed;
+          width: 1376px;
+        }
+        .pilot-table th, .pilot-table td {
+          padding: 12px 6px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          text-align: center;
+          vertical-align: middle;
+        }
+        .pilot-table td:nth-child(12) {
+          white-space: normal;
+          overflow: visible;
+        }
+        /* CID：96px */
+        .pilot-table th:nth-child(1), .pilot-table td:nth-child(1) { width: 96px; }
+        /* 航司 banner：两张 logo 并排 */
+        .pilot-table th:nth-child(2), .pilot-table td:nth-child(2) { width: 160px; }
+        .pilot-table th:nth-child(3), .pilot-table td:nth-child(3) { width: 110px; }  /* 呼号 */
+        .pilot-table th:nth-child(4), .pilot-table td:nth-child(4) { width: 164px; }  /* 昵称 */
+        .pilot-table th:nth-child(5), .pilot-table td:nth-child(5) { width: 68px; }   /* 应答机 */
+        .pilot-table th:nth-child(6), .pilot-table td:nth-child(6) { width: 68px; }   /* 机型 */
+        .pilot-table th:nth-child(7), .pilot-table td:nth-child(7) { width: 82px; }   /* 起飞机场 */
+        .pilot-table th:nth-child(8), .pilot-table td:nth-child(8) { width: 82px; }   /* 到达机场 */
+        .pilot-table th:nth-child(9), .pilot-table td:nth-child(9) { width: 68px; }   /* 地速 */
+        .pilot-table th:nth-child(10), .pilot-table td:nth-child(10) { width: 82px; } /* 高度 */
+        .pilot-table th:nth-child(11), .pilot-table td:nth-child(11) { width: 82px; } /* 连线时长 */
+        .pilot-table th:nth-child(12), .pilot-table td:nth-child(12) { width: 226px; } /* 进度（内含 160px 条） */
+        /* 所有表格首列统一留 30px 空白（CID/管制员/ATIS/观察员） */
+        .section-body table th:first-child,
+        .section-body table td:first-child { padding-left: 30px; }
+        .pilot-table td:nth-child(12) .progress-wrap { align-items: center; }
+        .pilot-table td:nth-child(12) .progress-text { text-align: center; }
         th {
-          color: #b7b7b7;
-          font-size: 15px;
-          font-weight: 700;
+          background: #111318;
+          color: #9ca3af;
+          font-size: 13px;
+          font-weight: 600;
         }
         td {
-          color: #d5d5d5;
+          color: #d1d5db;
           font-size: 14px;
         }
+        tr:last-child td {
+          border-bottom: none;
+        }
         .empty-row td {
-          color: #8c8f96;
-          padding: 18px 10px 24px;
-          font-size: 15px;
+          text-align: center;
+          color: #6b7280;
+          padding: 28px 14px;
+          font-size: 14px;
+        }
+        .airport {
+          color: #4ade80;
+          font-weight: 600;
+        }
+        .logon-time {
+          display: block;
+          text-align: center;
+          line-height: 1.45;
+          white-space: nowrap;
+          font-variant-numeric: tabular-nums;
+        }
+        /* 上线时间整列（含表头）居中 */
+        .controller-table th:nth-child(7),
+        .controller-table td:nth-child(7) {
+          text-align: center;
         }
         .progress-wrap {
           display: flex;
           flex-direction: column;
           gap: 5px;
-          align-items: center;
+          align-items: flex-start;
         }
         .progress-bar {
-          width: 100%;
+          /* 固定宽度：不再随“进度”列宽（29%）拉伸，避免宽屏下进度条过长 */
+          width: 160px;
+          max-width: 100%;
           height: 10px;
-          background: #2a2d35;
+          background: #20242b;
           border-radius: 999px;
           overflow: hidden;
         }
@@ -865,46 +1207,69 @@ function buildHtml(data: NonNullable<OnlineListResponse['data']>, _config: Confi
           border-radius: inherit;
         }
         .progress-text, .progress-empty {
-          color: #a6abb3;
+          color: #9ca3af;
           font-size: 12px;
         }
-        .footer-space { height: 4px; }
+        .footer {
+          text-align: center;
+          color: #6b7280;
+          font-size: 12px;
+          margin-top: 8px;
+        }
       </style>
     </head>
     <body>
       <div class="page">
-        <div class="topbar">
-          ${renderHeaderLogo()}
-          <div class="clock">${clock}</div>
-        </div>
-
-        <div class="panel">
-          <div class="titlebar">
-            <div class="brand">XFLYSIM <span>在线列表</span></div>
-            <div class="counts">
-              飞行员: ${onlineCounts.pilots} | 管制员: ${onlineCounts.controllers} | 自动情报广播: ${onlineCounts.atis} | 观察员: ${onlineCounts.observers}
+        <div class="header">
+          <div style="display: flex; align-items: center; gap: 16px;">
+            ${renderHeaderLogo()}
+            <div>
+              <h1>XFlySim全球连线飞行平台</h1>
+              <div class="update-time">更新于 ${updateTime}</div>
             </div>
           </div>
-
-          ${renderSection(
-            '飞行员',
-            ['CID', '机长', '呼号', '应答机', '机型', '起飞机场', '到达机场', '地速', '高度', '飞行时长', '进度'],
-            pilotRows,
-            '没有在线的机组',
-          )}
-
-          ${renderSection(
-            '管制员',
-            ['管制员', '昵称', '呼号', '管制等级', '频率', '管制信息', '服务时长'],
-            controllerRows,
-            '没有在线的管制员',
-          )}
-
-          ${renderSection('自动情报广播', ['管制员', '呼号', '频率', '信息', '服务时长'], atisRows, '没有在线的自动情报广播')}
-          ${renderSection('观察员', ['观察员', '呼号', '频率', '信息', '服务时长'], observerRows, '没有在线的观察员')}
-
-          <div class="footer-space"></div>
+          ${renderFlipClock()}
         </div>
+
+        <div class="cards">
+          <div class="card">
+            <div class="card-label">当前在线</div>
+            <div class="card-value">${onlineCounts.total}</div>
+          </div>
+          <div class="card">
+            <div class="card-label">在线飞行员</div>
+            <div class="card-value">${onlineCounts.pilots}</div>
+          </div>
+          <div class="card">
+            <div class="card-label">在线管制员</div>
+            <div class="card-value">${onlineCounts.controllers}</div>
+          </div>
+          <div class="card">
+            <div class="card-label">在线观察员</div>
+            <div class="card-value">${onlineCounts.observers}</div>
+          </div>
+        </div>
+
+        ${renderSection(
+          '在线飞行员',
+          ['CID', '航司', '呼号', '昵称', '应答机', '机型', '起飞机场', '到达机场', '地速', '高度', '连线时长', '进度'],
+          pilotRows,
+          '没有在线的机组',
+          'pilot-table',
+        )}
+
+        ${renderSection(
+          '在线管制员',
+          ['管制员', '呼号', '昵称', '管制等级', '频率', '管制信息', '上线时间', '服务时长'],
+          controllerRows,
+          '没有在线的管制员',
+          'controller-table',
+        )}
+
+        ${renderSection('在线ATIS', ['管制员', '呼号', '频率', '信息', '服务时长'], atisRows, '没有在线的自动情报广播')}
+        ${renderSection('在线观察员', ['观察员', '呼号', '昵称', '频率', '信息', '服务时长'], observerRows, '没有在线的观察员')}
+
+        <div class="footer">© ${new Date().getFullYear()} XFlySim. All rights reserved.</div>
       </div>
     </body>
   </html>
@@ -989,10 +1354,37 @@ async function enrichPilots(pilots: Pilot[], timeout: number, satoken: string) {
   })
 }
 
+// XFS API 不直接提供垂直速度；记录每个呼号最近一次的高度与采样时间，
+// 用两次查询的高度差 ÷ 时间差推算当前 V/S（ft/min，正值爬升、负值下降）。
+// AGL（离地高）API 同样未提供，垂直速度基于 MSL 高度差推算，爬降率本身一致。
+const altitudeTracker = new Map<string, { altitude: number, at: number }>()
+function computeVerticalSpeed(pilot: Pilot): number | null {
+  if (pilot.aircraft?.onGround) return null
+  const altitude = Number(pilot.altitude)
+  if (!Number.isFinite(altitude)) return null
+  const key = String(pilot.callsign || '').toUpperCase()
+  const now = Date.now()
+  const previous = altitudeTracker.get(key)
+  if (altitudeTracker.size > 500) {
+    for (const [k, v] of altitudeTracker) {
+      if (now - v.at > 30 * 60 * 1000) altitudeTracker.delete(k)
+    }
+  }
+  altitudeTracker.set(key, { altitude, at: now })
+  if (!previous) return null
+  const minutes = (now - previous.at) / 60000
+  // 间隔过短噪声大、过长（>15 分钟）推算值已无「当前」意义
+  if (minutes <= 0.02 || minutes > 15) return null
+  const vs = Math.round((altitude - previous.altitude) / minutes)
+  return Math.abs(vs) < 10 ? 0 : vs
+}
+
 function buildFlightHtml(pilot: Pilot, config: Config) {
   const callsign = pilot.callsign || '--'
   const flightNumber = callsign.replace(/^[A-Z]{3}/, '')
   const equipment = pilot.aircraft?.equipment || pilot.flightPlan?.aircraft || '--'
+  // 机型轮廓图（static/aircraft/<机型小写>.svg），未匹配到时为空
+  const aircraftSvgUri = loadAircraftSvg(equipment === '--' ? '' : equipment)
 
   const depInfo = pilot.depAirportInfo
   const destInfo = pilot.destAirportInfo
@@ -1012,6 +1404,11 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
 
   const groundSpeed = formatSpeed(pilot.groundSpeed)
   const altitudeFeet = pilot.altitude != null && !Number.isNaN(pilot.altitude) && pilot.altitude >= 0 ? `${Math.round(pilot.altitude)} ft` : '--'
+  // 当前垂直速度（推算值）：↑爬升 / ↓下降 / ±平飞；首次查询尚无采样时显示 --
+  const verticalSpeed = Number(pilot.verticalSpeed)
+  const vsDisplay = Number.isFinite(verticalSpeed)
+    ? `${verticalSpeed > 0 ? '↑' : verticalSpeed < 0 ? '↓' : '±'}${Math.abs(verticalSpeed)} ft/min`
+    : '-- ft/min'
   const attitude = getPilotAttitude(pilot)
   const pitch = attitude ? Math.max(-30, Math.min(30, attitude.pitch)) : 0
   const bank = attitude ? Math.max(-60, Math.min(60, attitude.bank)) : 0
@@ -1059,6 +1456,7 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
     departure: depInfo && { lon: depInfo.longitude, lat: depInfo.latitude, name: depName },
     arrival: destInfo && { lon: destInfo.longitude, lat: destInfo.latitude, name: destName },
     aircraft: Number.isFinite(latitude) && Number.isFinite(longitude) ? { lon: longitude, lat: latitude, heading: pilot.heading || 0, name: callsign } : null,
+    aircraftIcon: aircraftSvgUri || null,
   }).replace(/</g, '\\u003c')
   const mapToken = JSON.stringify(config.mapboxAccessToken || '')
 
@@ -1088,6 +1486,9 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
           color: #e8e8e8;
           font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
           padding: 20px;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          text-rendering: optimizeLegibility;
         }
         .page {
           max-width: 1280px;
@@ -1168,6 +1569,18 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
           font-weight: 800;
           color: #fff;
           letter-spacing: 1px;
+        }
+        .airline-logo {
+          height: 36px;
+          width: auto;
+          max-width: 72px;
+          object-fit: contain;
+          margin-right: 12px;
+          border-radius: 4px;
+          /* 部分航司 logo 为黑色透明底图，深色界面上不可见：底色固定为白色 */
+          background: #ffffff;
+          padding: 3px 4px;
+          box-sizing: content-box;
         }
         .flight-equipment {
           font-size: 14px;
@@ -1512,6 +1925,7 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
           <div class="flight-title">
             <div class="flight-meta">
               <div class="flight-callsign">
+                ${pilot.airlineLogoUri ? `<img class="airline-logo" src="${pilot.airlineLogoUri}" alt="airline">` : ''}
                 <span>${escapeHtml(callsign)}</span>
               </div>
             </div>
@@ -1610,6 +2024,10 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
               <div class="data-label">地速/高度 📈</div>
               <div class="data-value" style="margin-top: 8px;">${escapeHtml(groundSpeed)}kt / ${escapeHtml(altitudeFeet)}</div>
             </div>
+            <div>
+              <div class="data-label">垂直速度 ↕️</div>
+              <div class="data-value" style="margin-top: 8px;">${escapeHtml(vsDisplay)}</div>
+            </div>
           </div>
           <div class="flight-details">
             <div class="nd-column">
@@ -1661,7 +2079,7 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
           const status = document.getElementById('map-status')
           const flight = ${mapData}
           const token = ${mapToken}
-          const icons = { departure: '${MAP_DEPARTURE_ICON}', arrival: '${MAP_ARRIVAL_ICON}', vor: '${MAP_VOR_ICON}', waypoint: '${MAP_WAYPOINT_ICON}', aircraft: '${MAP_AIRCRAFT_ICON}' }
+          const icons = { departure: '${MAP_DEPARTURE_ICON}', arrival: '${MAP_ARRIVAL_ICON}', vor: '${MAP_VOR_ICON}', waypoint: '${MAP_WAYPOINT_ICON}', aircraft: '${MAP_AIRCRAFT_ICON}', aircraftType: '${aircraftSvgUri}' }
           // 截图端只在此标记为 true 后再截图；不要把地图图层或标记的异步绘制遗漏掉。
           window.__flightMapReady = false
           const finish = (message) => { status.textContent = message || ''; window.__flightMapReady = true }
@@ -1679,7 +2097,8 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
             if (icon === 'aircraft') {
               element.className = 'map-aircraft-marker'
               const image = document.createElement('img')
-              image.src = icons[icon]
+              // 有对应机型轮廓 SVG 时优先使用，否则回退到通用飞机图标
+              image.src = icons.aircraftType || icons[icon]
               image.className = 'map-aircraft-image'
               image.style.transform = 'rotate(' + rotation + 'deg)'
               element.appendChild(image)
@@ -1790,52 +2209,88 @@ function buildFlightHtml(pilot: Pilot, config: Config) {
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('xflysim-online-list')
 
+  /**
+   * 统一视口参数：附带 deviceScaleFactor 做超采样，手机端放大查看时文字与线条更锐利。
+   */
+  function getViewport(width: number, height: number) {
+    return {
+      width: Math.min(Math.max(320, Math.round(width)), 4096),
+      height: Math.min(Math.max(320, Math.round(height)), 4096),
+      deviceScaleFactor: config.deviceScaleFactor,
+    }
+  }
+
+  /**
+   * 宽度固定为配置的截图宽度，高度按页面实际内容底边自适应：
+   * fullPage 截图的高度不会低于视口高度（documentElement.scrollHeight 恒 ≥ 视口高），
+   * 视口过高时截图底部会出现大片空白，因此高度仍需实测后收敛。
+   */
+  async function fitViewportToContent(page: any): Promise<{ width: number, height: number }> {
+    const contentHeight = await page.evaluate(() => {
+      // 用真实内容元素的底边测量高度：scrollHeight 恒 ≥ 视口高，不能直接用
+      return Math.ceil(Array.from(document.body?.children ?? []).reduce((max, el) => {
+        const rect = (el as HTMLElement).getBoundingClientRect()
+        return Math.max(max, rect.bottom)
+      }, 0))
+    })
+    const viewport = getViewport(config.viewportWidth, contentHeight || config.viewportHeight)
+    await page.setViewport(viewport)
+    return viewport
+  }
+
+  // 渲染在线列表截图，供原生指令与固定触发格式的中间件复用。
+  async function renderOnlineList(): Promise<any> {
+    try {
+      if (config.enableLog) logger.info('开始查询在线列表')
+      const data = await fetchOnlineList(config)
+      if (config.enableLog) logger.info(`获取到 ${data.pilots?.length || 0} 个飞行员，${data.controllers?.length || 0} 个管制员`)
+      const enriched = {
+        ...data,
+        pilots: await enrichPilots(data.pilots || [], config.timeout, config.satoken),
+      }
+      // 为每个不同航司拉取图标（按 ICAO 缓存），显示在呼号左侧
+      await Promise.all(enriched.pilots.map(async (pilot: any) => {
+        const airlineCode = pilot.aircraft?.airline
+          || pilot.userAirlineIcao
+          || (String(pilot.callsign || '').match(/^[A-Z]{2,3}/)?.[0] ?? '')
+        const [logoUri, logoFr24Uri] = await Promise.all([
+          loadAirlineLogo(airlineCode, config.timeout),
+          loadAirlineLogoFr24(airlineCode, config.timeout),
+        ])
+        pilot.airlineLogoUri = logoUri
+        pilot.airlineLogoFr24Uri = logoFr24Uri
+      }))
+      if (config.enableLog) logger.info('开始生成截图')
+      const page = await ctx.puppeteer.page()
+      try {
+        // 先以配置尺寸渲染，再将视口收敛到实际内容大小（宽度按内容自适应，
+        // 高度按内容底边自适应），fullPage 截图不再出现底部空白。
+        await page.setViewport(getViewport(config.viewportWidth, config.viewportHeight))
+        await page.setContent(buildHtml(enriched, config), { waitUntil: 'load' })
+        await page.evaluate(async () => {
+          await document.fonts?.ready
+          await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+        })
+        const viewport = await fitViewportToContent(page)
+        await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+        if (config.enableLog) logger.info(`截图尺寸: ${viewport.width}x${viewport.height}px`)
+        const buffer = await page.screenshot({ type: 'jpeg', quality: config.imageQuality, fullPage: true })
+        if (config.enableLog) logger.info('截图生成成功')
+        return h.image(buffer, 'image/jpeg')
+      } finally {
+        await page.close()
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger.error(message)
+      if (config.enableLog) logger.error('查询失败', error)
+      return `查询失败: ${message}`
+    }
+  }
+
   ctx.command(config.command, '查询 XFLYSIM 在线列表')
     .alias(config.alias)
-    .action(async () => {
-      try {
-        if (config.enableLog) logger.info('开始查询在线列表')
-        const data = await fetchOnlineList(config)
-        if (config.enableLog) logger.info(`获取到 ${data.pilots?.length || 0} 个飞行员，${data.controllers?.length || 0} 个管制员`)
-        const enriched = {
-          ...data,
-          pilots: await enrichPilots(data.pilots || [], config.timeout, config.satoken),
-        }
-        if (config.enableLog) logger.info('开始生成截图')
-        const page = await ctx.puppeteer.page()
-        try {
-          // 先以配置尺寸渲染，再根据实际内容调整宽度；截图高度由 fullPage 自动延展。
-          await page.setViewport({ width: Math.max(320, config.viewportWidth), height: Math.max(320, config.viewportHeight) })
-          await page.setContent(buildHtml(enriched, config), { waitUntil: 'load' })
-          await page.evaluate(async () => {
-            await document.fonts?.ready
-            await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
-          })
-          const contentWidth = await page.evaluate(() => Math.ceil(Math.max(
-            document.documentElement.scrollWidth,
-            document.body.scrollWidth,
-          )))
-          if (contentWidth > 0) {
-            await page.setViewport({
-              width: Math.min(Math.max(320, contentWidth), 4096),
-              height: Math.max(320, config.viewportHeight),
-            })
-          }
-          await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-          if (config.enableLog) logger.info(`截图尺寸: ${contentWidth}px`)
-          const buffer = await page.screenshot({ type: 'jpeg', quality: 92, fullPage: true })
-          if (config.enableLog) logger.info('截图生成成功')
-          return h.image(buffer, 'image/jpeg')
-        } finally {
-          await page.close()
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        logger.error(message)
-        if (config.enableLog) logger.error('查询失败', error)
-        return `查询失败: ${message}`
-      }
-    })
+    .action(async () => renderOnlineList())
 
   if (config.enableResume) {
     ctx.command('简历 <cid:string>', '查询 XFLYSIM 用户简历')
@@ -1854,7 +2309,7 @@ export function apply(ctx: Context, config: Config) {
           if (config.enableLog) logger.info('开始生成简历截图')
           const page = await ctx.puppeteer.page()
           try {
-            await page.setViewport({ width: Math.max(320, config.viewportWidth), height: 320 })
+            await page.setViewport(getViewport(config.viewportWidth, 320))
             const resumeData = buildResumeRecord(record as Record<string, any>)
             const virtualMoney = Number((argv as any).options?.v)
             if (Number.isFinite(virtualMoney)) resumeData.money = `¥${virtualMoney.toFixed(2)}`
@@ -1863,7 +2318,9 @@ export function apply(ctx: Context, config: Config) {
               await document.fonts?.ready
               await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
             })
-            const buffer = await page.screenshot({ type: 'jpeg', quality: 92, fullPage: true })
+            await fitViewportToContent(page)
+            await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+            const buffer = await page.screenshot({ type: 'jpeg', quality: config.imageQuality, fullPage: true })
             if (config.enableLog) logger.info('简历截图生成成功')
             return h.image(buffer, 'image/jpeg')
           } finally { await page.close() }
@@ -1876,53 +2333,117 @@ export function apply(ctx: Context, config: Config) {
       })
   }
 
+  // 渲染函数在下方 enableFlight 块内赋值；关闭航班命令时中间件不会调用到它
+  let renderFlightCard: (callsignInput: string) => Promise<any>
+
   if (config.enableFlight) {
-    ctx.command(`${config.flightCommand} <callsign:string>`, '查询指定呼号的航班信息')
-      .action(async (_, callsign) => {
-        const target = String(callsign || '').trim().toUpperCase()
-        if (!target) return '请提供呼号，例如：航班 XFS5867'
-        try {
-          if (config.enableLog) logger.info(`查询航班: ${target}`)
-          const data = await fetchOnlineList(config)
-          const pilot = (data.pilots || []).find(p => (p.callsign || '').toUpperCase() === target)
-          if (!pilot) {
-            if (config.enableLog) logger.warn(`未找到呼号 ${target}`)
-            return `未找到呼号 ${target} 的航班`
-          }
-          if (config.enableLog) logger.info(`找到航班: ${pilot.callsign}, 机型: ${pilot.aircraft?.equipment || pilot.flightPlan?.aircraft}`)
-          const enriched = (await enrichPilots([pilot], config.timeout, config.satoken))[0]
-          if (config.enableLog) logger.info('开始生成航班截图')
-          const page = await ctx.puppeteer.page()
-          try {
-            await page.setViewport({ width: Math.max(320, config.viewportWidth), height: Math.max(320, config.viewportHeight) })
-            await page.setContent(buildFlightHtml(enriched, config), { waitUntil: 'load' })
-            const contentWidth = await page.evaluate(() => Math.ceil(Math.max(
-              document.documentElement.scrollWidth,
-              document.body.scrollWidth,
-            )))
-            if (contentWidth > 0) {
-              await page.setViewport({
-                width: Math.min(Math.max(320, contentWidth), 4096),
-                height: Math.max(320, config.viewportHeight),
-              })
-            }
-            // 最终视口会触发地图重排，因此需在其后等待底图、所有点位图标和各航段全部绘制。
-            await page.evaluate(() => window.dispatchEvent(new Event('resize')))
-            await page.waitForFunction(() => (window as any).__flightMapReady === true, { timeout: config.timeout })
-            await new Promise(resolve => setTimeout(resolve, 250))
-            if (config.enableLog) logger.info(`航班截图尺寸: ${contentWidth}px`)
-            const buffer = await page.screenshot({ type: 'jpeg', quality: 92, fullPage: true })
-            if (config.enableLog) logger.info('航班截图生成成功')
-            return h.image(buffer, 'image/jpeg')
-          } finally {
-            await page.close()
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          logger.error(message)
-          if (config.enableLog) logger.error('查询航班失败', error)
-          return `查询航班失败: ${message}`
+    // 渲染指定呼号的航班信息卡片，供原生指令与固定触发格式的中间件复用。
+    renderFlightCard = async function renderFlightCard(callsignInput: string): Promise<any> {
+      const target = String(callsignInput || '').trim().toUpperCase()
+      if (!target) return '请提供呼号，例如：航班 XFS5867'
+      try {
+        if (config.enableLog) logger.info(`查询航班: ${target}`)
+        const data = await fetchOnlineList(config)
+        const pilot = (data.pilots || []).find(p => (p.callsign || '').toUpperCase() === target)
+        if (!pilot) {
+          if (config.enableLog) logger.warn(`未找到呼号 ${target}`)
+          return `未找到呼号 ${target} 的航班`
         }
-      })
+        if (config.enableLog) logger.info(`找到航班: ${pilot.callsign}, 机型: ${pilot.aircraft?.equipment || pilot.flightPlan?.aircraft}`)
+        const enriched = (await enrichPilots([pilot], config.timeout, config.satoken))[0]
+        // 基于与上次查询的高度差推算垂直速度（API 不直接提供）
+        enriched.verticalSpeed = computeVerticalSpeed(enriched)
+        // 航司图标：优先 aircraft.airline，其次注册航司 ICAO，最后呼号前缀
+        const airlineCode = enriched.aircraft?.airline
+          || enriched.userAirlineIcao
+          || (String(enriched.callsign || '').match(/^[A-Z]{2,3}/)?.[0] ?? '')
+        enriched.airlineLogoUri = await loadAirlineLogo(airlineCode, config.timeout)
+        if (config.enableLog) logger.info('开始生成航班截图')
+        const page = await ctx.puppeteer.page()
+        try {
+          await page.setViewport(getViewport(config.viewportWidth, config.viewportHeight))
+          await page.setContent(buildFlightHtml(enriched, config), { waitUntil: 'load' })
+          await page.evaluate(() => window.dispatchEvent(new Event('resize')))
+          await page.waitForFunction(() => (window as any).__flightMapReady === true, { timeout: config.timeout })
+          await new Promise(resolve => setTimeout(resolve, 250))
+          // 仅高度按实际内容收敛（宽度固定），消除 fullPage 截图的底部空白；
+          // 视口变化会触发地图重排，因此需再次等待地图绘制完成。
+          const flightViewport = await fitViewportToContent(page)
+          await page.evaluate(() => window.dispatchEvent(new Event('resize')))
+          await page.waitForFunction(() => (window as any).__flightMapReady === true, { timeout: config.timeout })
+          await new Promise(resolve => setTimeout(resolve, 250))
+          if (config.enableLog) logger.info(`航班截图尺寸: ${flightViewport.width}x${flightViewport.height}px`)
+          const buffer = await page.screenshot({ type: 'jpeg', quality: config.imageQuality, fullPage: true })
+          if (config.enableLog) logger.info('航班截图生成成功')
+          return h.image(buffer, 'image/jpeg')
+        } finally {
+          await page.close()
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        logger.error(message)
+        if (config.enableLog) logger.error('查询航班失败', error)
+        return `查询航班失败: ${message}`
+      }
+    }
+
+    ctx.command(`${config.flightCommand} <callsign:string>`, '查询指定呼号的航班信息')
+      .action(async (_, callsign) => renderFlightCard(String(callsign || '')))
   }
+
+  // SnowLuma 等协议端会把「引用回复 / 艾特」消息渲染成纯文本前缀，例如：
+  //   ID:579672981 @3889005625 / 航班 N50EX
+  // 注意：消息里的艾特可能是真正的 at 元素（Koishi 序列化为
+  // <at id="3889005625" name="..."/>），也可能是纯文本 @3889005625，
+  // 两种形态都要兼容。仅当消息包含固定触发格式 “@3889005625 / <指令词>”
+  // 时才响应；其他任何消息格式不受影响，原生指令仍走指令系统。
+  const FLIGHT_TRIGGER_USER_ID = '3889005625'
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // 固定触发格式 “@3889005625 / <指令词> [参数]” 支持的指令词
+  const flightWords = config.enableFlight
+    ? [...new Set([config.flightCommand].filter(Boolean).map(w => w.toLowerCase()))]
+    : []
+  const onlineWords = [...new Set([config.command, config.alias, '在线查询', '在线列表'].filter(Boolean).map(w => w.toLowerCase()))]
+  ctx.middleware(async (session, next) => {
+    const content = String(session.content || '').trim()
+    if (!content) return next()
+    if (content.startsWith(config.flightCommand) || content.startsWith(config.command)) return next()
+    const cleaned = content
+      // 引用头文本 / quote 元素：ID:1621078490 或 <quote id="..."/>
+      .replace(/ID\s*[:：]\s*\d+/gi, ' ')
+      .replace(/<quote[^>]*>/gi, ' ')
+      // at 元素：id 等于触发账号时归一化为 @触发账号，其余剔除
+      .replace(/<at\s+([^>]*)>/gi, (_m, attrs: string) => {
+        const idMatch = String(attrs).match(/id=["']?(\d+)/i)
+        return idMatch && idMatch[1] === FLIGHT_TRIGGER_USER_ID ? ` @${FLIGHT_TRIGGER_USER_ID} ` : ' '
+      })
+      .replace(/\[CQ:at,qq=(?:['"]?)3889005625(?:['"]?)[^\]]*\]/gi, ` @${FLIGHT_TRIGGER_USER_ID} `)
+    const match = cleaned.match(new RegExp(
+      `@${FLIGHT_TRIGGER_USER_ID}\\s*[/／]\\s*(\\S+)(?:\\s+([A-Za-z0-9\\-]+))?`,
+      'i',
+    ))
+    if (!match) return next()
+    const word = (match[1] || '').toLowerCase()
+    const arg = (match[2] || '').trim()
+    let result: any = null
+    try {
+      if (flightWords.includes(word)) {
+        if (config.enableLog) logger.info(`航班查询（@${FLIGHT_TRIGGER_USER_ID} 触发）: ${arg}`)
+        result = await renderFlightCard(arg)
+      } else if (onlineWords.includes(word)) {
+        if (config.enableLog) logger.info(`在线查询（@${FLIGHT_TRIGGER_USER_ID} 触发）`)
+        result = await renderOnlineList()
+      } else {
+        // 便于排查未命中的原因：输出触发检测前的原始内容
+        if (config.enableLog) logger.info(`固定触发未命中指令词 "${word}"，原始内容: ${content}`)
+        return next()
+      }
+      await session.send(result)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      logger.error(`固定触发查询失败（${word}）: ${message}`)
+      await session.send(`查询失败: ${message}`).catch(() => undefined)
+    }
+    // 已处理，不再向下传递
+  })
 }
